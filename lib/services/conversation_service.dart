@@ -1,62 +1,101 @@
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/foundation.dart';
-import '/services/stt_service.dart';
-import '/services/tts_service.dart';
+import 'stt_service.dart';
+import 'tts_service.dart';
+import 'scenario_service.dart';
 
 class ConversationService {
   final _db = FirebaseDatabase.instance.ref();
   final STTService stt;
   final TTSService tts;
+  final ScenarioService scenarioService;
 
   int turnCount = 0;
-  int conversationStage = 1; // 1=라포, 2=도움요청, 3=마무리
-  String? contextText;
+  int conversationStage = 1; // 1=라포, 2=도움요청, 3=칭찬및잡담
 
   ConversationService({
     required this.stt,
     required this.tts,
+    required this.scenarioService,
   }) {
     _setupTtsListeners();
   }
 
-  Future<void> loadCharacterContext(String username) async {
-    try {
-      final ref = _db.child('preference/$username/character_settings/contextText');
-      final snapshot = await ref.get();
-      if (snapshot.exists) {
-        contextText = snapshot.value.toString();
-        debugPrint("[Conversation] contextText 로드 완료: $contextText");
-      } else {
-        debugPrint("[Conversation] contextText 없음");
-      }
-    } catch (e) {
-      debugPrint("[Conversation] contextText 로드 실패: $e");
-    }
+  // 3단계에서 2단계로 복귀하는 함수 (InCallScreen에서 Next 버튼 누르면 호출)
+  void startNewRound() {
+    conversationStage = 2;
+    debugPrint("Stage 2로 복귀 (새 라운드)");
   }
 
   Future<String> getStageInstruction({
     required String username,
     required String characterName,
+    required String dbPath,
   }) async {
-    // 2단계 (도움 요청) 로직
+
     if (conversationStage == 2) {
-      if (contextText == null) {
-        await loadCharacterContext(username);
+      if (scenarioService.currentContext == null) {
+        await scenarioService.loadNewScenario(username);
       }
+
+      final currentSituation = scenarioService.currentContext ?? "도움이 필요한 상황";
+
+      if (scenarioService.contextIndex != null) {
+        try {
+          final reportRef = _db.child(dbPath);
+          final snapshot = await reportRef.get(); // 현재 리포트 데이터를 먼저 읽어옴
+
+          List<int> contextIdList = [];
+
+          if (snapshot.exists) {
+            final data = Map<String, dynamic>.from(snapshot.value as Map);
+            final rawContextIds = data['contextId'];
+
+            // 기존 contextId가 List 형태이면 불러오고, 아니면 무시
+            if (rawContextIds is List) {
+              contextIdList = List<int>.from(rawContextIds.whereType<int>());
+            } else if (rawContextIds is int) {
+              // 혹시 과거에 int로 저장된 것이 있다면 리스트로 시작
+              contextIdList = [rawContextIds];
+            }
+          }
+
+          // 새 Index를 리스트에 추가
+          contextIdList.add(scenarioService.contextIndex!);
+
+          await reportRef.update({
+            // List<int> 형태로 덮어쓰기: 'contextId': [0, 3, 5]
+            'contextId': contextIdList,
+          });
+          debugPrint("[Firebase] 리포트 메타데이터 업데이트 완료 (contextId: ${scenarioService.contextIndex})");
+        } catch (e) {
+          debugPrint("[Firebase] 리포트 메타데이터 업데이트 실패: $e");
+        }
+      }
+
       return """
-      지금은 2단계야. 너는 캐릭터 $characterName이고, $username과 대화 중이야.
-      너는 '${contextText ?? "작은 문제가 생긴 상황"}' 상황을 겪고 있어 곤란한 상태야.
-      이 상황을 설명하면서 도움을 요청해.
-      $username이 너를 도와주는 영웅처럼 느끼게 해줘.
+      [중요: 새로운 상황 시작]
+      이전의 대화 내용이나 상황은 모두 잊어버려. 지금 새로운 상황극이 시작됐어.
+      
+      너의 역할: $characterName
+      현재 상황: '$currentSituation'
+      
+      위 상황을 겪고 있어서 아이($username)에게 도움을 요청해야 해.
+      너는 이 상황에서 해야 할 말을 모른다고 가정하고, $username에게 어떻게 말하면 좋을지 물어봐야 한다.
+      
+      e.g.)  목이 말라서 물을 마시고 싶은 상황이라면, ‘내가 물을 마시려면 뭐라고 말해야 할까?’라고 아이에게 물어본다.
       """;
     }
 
-    // 그 외 단계 로직
     switch (conversationStage) {
       case 1:
         return "지금은 1단계야. 아이와 친해지고 편안하게 대화해.";
       case 3:
-        return "지금은 3단계야. 아이가 너의 문제를 해결해줬어. 이제 고맙다고 말하며 자연스럽게 대화를 마무리해.";
+        return """
+        지금은 3단계야. 아이가 미션을 성공해서 기분 좋은 상태야.
+        계속해서 아이를 칭찬해주거나, 가벼운 일상 대화를 이어가.
+        아직 작별 인사는 하지 마. 아이가 더 놀고 싶어 하니까 즐겁게 받아줘.
+        """;
       default:
         return "항상 따뜻하고 친근하게 대화해.";
     }
@@ -77,15 +116,13 @@ class ConversationService {
     await stt.initialize();
   }
 
-  // 턴 수에 따라 단계를 변경하는 로직
   void _updateConversationStage() {
-    // 예시: 1~2턴(1단계), 3~5턴(2단계), 10턴 이상(3단계)
+    if (conversationStage == 3 || conversationStage == 2) return;
+    // 1, 2단계 자동 전환 로직
     if (turnCount < 3) {
       conversationStage = 1;
-    } else if (turnCount < 10) {
-      conversationStage = 2;
     } else {
-      conversationStage = 3; // TODO: 2단계 로직 구성 후 next버튼을 통해 도달할 수 있게 수정
+      conversationStage = 2;
     }
   }
 
@@ -93,10 +130,8 @@ class ConversationService {
     if (userText.trim().isEmpty) return;
 
     turnCount++;
-
     final prevStage = conversationStage;
 
-    // 복잡한 검사 없이 턴 수만 확인하여 단계 업데이트로 구현
     _updateConversationStage();
 
     debugPrint("[Conversation] 발화 감지 | 턴: $turnCount | 단계: ${_stageName(conversationStage)}");
@@ -108,14 +143,10 @@ class ConversationService {
 
   String _stageName(int stage) {
     switch (stage) {
-      case 1:
-        return "1단계 (라포)";
-      case 2:
-        return "2단계 (도움 요청)";
-      case 3:
-        return "3단계 (마무리)";
-      default:
-        return "알 수 없음";
+      case 1: return "1단계 (라포)";
+      case 2: return "2단계 (도움 요청)";
+      case 3: return "3단계 (칭찬/잡담)";
+      default: return "알 수 없음";
     }
   }
 
@@ -128,21 +159,10 @@ class ConversationService {
   }) async {
     try {
       if (text.trim().isEmpty) return;
-
-      final safePath = dbPath
-          .replaceAll('.', '-')
-          .replaceAll('#', '-')
-          .replaceAll('\$', '-')
-          .replaceAll('[', '-')
-          .replaceAll(']', '-')
-          .replaceAll('T', '_');
-
+      final safePath = dbPath.replaceAll('.', '-').replaceAll('#', '-').replaceAll('\$', '-').replaceAll('[', '-').replaceAll(']', '-').replaceAll('T', '_');
       final now = timestamp ?? DateTime.now();
-      final adjustedTime =
-      role == "user" ? now : now.add(const Duration(milliseconds: 1));
-
-      final msgId =
-          "msg_${adjustedTime.toIso8601String().replaceAll('T', '_').split('.').first}_$role";
+      final adjustedTime = role == "user" ? now : now.add(const Duration(milliseconds: 1));
+      final msgId = "msg_${adjustedTime.toIso8601String().replaceAll('T', '_').split('.').first}_$role";
       final msgRef = _db.child('$safePath/conversation/messages/$msgId');
 
       await msgRef.set({
@@ -154,7 +174,7 @@ class ConversationService {
         ...?extra,
       });
 
-      debugPrint("[Firebase] 저장 완료 → $safePath/conversation/messages/$msgId");
+      debugPrint("[Firebase] 저장 완료 → $msgId");
     } catch (e) {
       debugPrint("[Firebase] 저장 오류: $e");
     }
